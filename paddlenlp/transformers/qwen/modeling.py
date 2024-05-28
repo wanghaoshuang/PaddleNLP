@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from cgi import print_form
 import math
 import warnings
 from functools import partial
@@ -113,6 +114,7 @@ class QWenAttention(nn.Layer):
 
         self.scale_attn_weights = True
         self.enable_recompute = False
+        # self.recompute_granularity = "full" #config.recompute_granularity
         self.recompute_granularity = config.recompute_granularity
 
         self.projection_size = config.kv_channels * config.num_attention_heads
@@ -242,6 +244,7 @@ class QWenAttention(nn.Layer):
         output_attentions=False,
         use_cache=False,
     ):
+        print(f"QKV: {self.c_attn.name}; {hidden_states.shape}")
         # [bz, sql, hid] ==> [bz, sql, 3*hid]
         mixed_x_layer = self.c_attn(hidden_states)
         # [bz, sql, 3*hid] ==> [bz, sql, hid]
@@ -316,6 +319,7 @@ class QWenAttention(nn.Layer):
             attn_output, attn_weight = self._attn(query, key, value, attention_mask)
         context_layer = self._merge_heads(attn_output, self.num_heads, self.head_dim)
 
+        print(f"outlinear: {self.c_proj.name}; {context_layer.shape}")
         attn_output = self.c_proj(context_layer)
         outputs = (attn_output, present)
         if output_attentions:
@@ -353,12 +357,14 @@ class QWenMLP(nn.Layer):
             self.c_proj = nn.Linear(ff_dim_in, config.hidden_size, bias_attr=not config.no_bias)
 
     def forward(self, hidden_states):
+        print(f"FFN1: {self.w1.name}; {hidden_states.shape}")
         # up
         a1 = self.w1(hidden_states)
         # gate
         a2 = self.w2(hidden_states)
         intermediate_parallel = a1 * F.silu(a2)
         # down
+        print(f"FFN2:  {self.c_proj.name}; {intermediate_parallel.shape}")
         output = self.c_proj(intermediate_parallel)
         return output
 
@@ -567,7 +573,7 @@ class QWenModel(QWenPretrainedModel):
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
         self.embed_dim = config.hidden_size
-        self.enable_recompute = False
+        self.enable_recompute = False # debugggggg
         self.recompute_granularity = config.recompute_granularity
 
         if config.tensor_parallel_degree > 1:
@@ -670,6 +676,7 @@ class QWenModel(QWenPretrainedModel):
         output_hidden_states=None,
         return_dict=None,
     ):
+        print("Qwen------------------------")
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1055,13 +1062,85 @@ class QWenRMSNorm(nn.Layer):
             dtype=paddle.get_default_dtype(),
             default_initializer=nn.initializer.Constant(1.0),
         )
-
+        self.grad = None
+        self.covariance = None
+        self.test_mode = False
+        self.Q = None
+        self.Qt = None
+        self.eigvals = None
+        self.pruned_ratio = 0.
+        self.x = None
+        self.sample_num = 0
     def _norm(self, x):
-        return x * paddle.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        if self.x is not None:
+            del self.x
+            self.x = None
+        self.x = x
+        if self.test_mode is False:
+            x.register_hook(self.get_hook())
+        elif self.Q is None:
+            self.Q, self.Qt = self._cal_Q()
+
+        if self.Q is not None:
+            x = x @ self.Q
+        out = x * paddle.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        if self.Q is not None:
+            out = out @ self.Qt
+        return out
+    def get_hook(self):
+        def grad_hook(grad):
+            # (bs*seq, hidden)
+            grad = paddle.reshape(grad, [-1, self.x.shape[-1]])
+            x = paddle.reshape(self.x, [-1, self.x.shape[-1]])
+            token_num = x.shape[0]
+            if self.covariance is None:
+                self.grad = paddle.diagonal(paddle.matmul(grad, grad, transpose_x=True)) / token_num
+                self.covariance = paddle.matmul(x, x, transpose_x=True) / token_num
+                self.sample_num = 1
+                
+            else:
+                self.covariance = self.covariance + paddle.matmul(x, x, transpose_x=True) / token_num
+                self.grad = self.grad + paddle.diagonal(paddle.matmul(grad, grad, transpose_x=True)) / token_num
+                self.sample_num += 1
+            
+        return grad_hook
+    def _cal_Q(self):
+        rate = 0.001
+        covariance = self.covariance.cuda() / self.sample_num
+        grad = paddle.reshape(self.grad.cuda() / self.sample_num, [1, -1]) # 1, D
+        covariance = paddle.unsqueeze(self.covariance.cuda(), axis=0)
+        eigvals, eigvecs = paddle.linalg.eigh(covariance)
+        eigvecs = paddle.squeeze(eigvecs) # D, D
+        eigvals = paddle.squeeze(eigvals) # D
+        
+        eigvals = paddle.squeeze(grad @ eigvecs) + eigvals
+
+        index = paddle.argsort(eigvals, descending=True)
+        eigvals = eigvals[index]
+        eigvecs = eigvecs[:, index]
+        self.eigvals = eigvals
+        eigsum = eigvals.sum() * rate
+        Q = eigvecs
+        Qt = eigvecs.transpose([1, 0])
+
+        _sum = 0.
+        total_num = eigvals.shape[0]
+        for i in reversed(range(total_num)):
+            _sum += eigvals[i]
+            pruned_ratio = (total_num-i)/total_num
+            # if _sum >= eigsum or pruned_ratio>0.30:
+            if pruned_ratio > 0.90:
+            # if pruned_ratio > 0.0001:
+            # if _sum >= eigsum:
+                Q[:,i:] = 0.0
+                self.pruned_ratio = (total_num-i)/total_num
+                print(f"pruned {((total_num-i)/total_num)*100:.2f}%; layer: {self.weight.name}")
+                break
+        return Q, Qt
 
     def forward(self, x):
-        if self.config.use_fused_rms_norm:
-            return rms_norm_fused(x, self.weight, self.eps)
+        # if self.config.use_fused_rms_norm:
+        #     return rms_norm_fused(x, self.weight, self.eps)
 
         output = self._norm(x.astype(paddle.float32)).astype(x.dtype)
         return output * self.weight

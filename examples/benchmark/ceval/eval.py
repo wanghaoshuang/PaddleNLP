@@ -13,13 +13,17 @@
 # limitations under the License.
 
 # Adapted from https://github.com/ymcui/Chinese-LLaMA-Alpaca and https://github.com/SJTU-LIT/ceval
+import sys
 import argparse
 import json
 import os
 import time
+import pickle
+import numpy as np
 
 import paddle
 import pandas as pd
+from paddlenlp.transformers.qwen.modeling import QWenRMSNorm
 from model_evaluator import ModelEvaluator
 from paddle.distributed import fleet
 
@@ -50,6 +54,7 @@ from paddleslim.quant.observers import (
     AVGObserver,
     KLObserver,
 )
+#from paddleslim.analysis import GBQA, SlimAnalysis
 
 
 def run_ptq(args, evaluator):
@@ -170,6 +175,7 @@ def run_ptq(args, evaluator):
         eval_loop(args, evaluator, args.ptq_iters)
         evaluator.model = evaluator.ptq.convert(evaluator.model, inplace=True)
         print(f"\n=======PTQ Done !!!=======")
+        # print(f"quantized model: {evaluator.model}")
 
     if args.do_gptq:
         print(f"\n=======begin GPTQ=======")
@@ -285,7 +291,7 @@ def eval_loop(args, evaluator, target_iters):
     print("Total iters:", start_iters)
 
 
-def main(args, evaluator, take):
+def main(args, evaluator, take, do_test=False, do_backward=False):
     assert os.path.exists("subject_mapping.json"), "subject_mapping.json not found!"
     with open("subject_mapping.json") as f:
         subject_mapping = json.load(f)
@@ -310,7 +316,6 @@ def main(args, evaluator, take):
 
         val_df = pd.read_csv(val_file_path) if args.do_test is False else pd.read_csv(test_file_path)
         dev_df = pd.read_csv(dev_file_path) if args.few_shot else None
-
         correct_ratio, answers = evaluator.eval_subject(
             subject_name,
             val_df,
@@ -320,7 +325,8 @@ def main(args, evaluator, take):
             cot=args.cot,
             with_prompt=args.with_prompt,
             constrained_decoding=args.constrained_decoding,
-            do_test=args.do_test,
+            do_test=do_test,
+            do_backward=do_backward,
         )
         print(f"Subject: {subject_name}")
         print(f"Acc: {correct_ratio}")
@@ -331,35 +337,36 @@ def main(args, evaluator, take):
             "correct": correct_ratio * len(val_df) / 100,
         }
         all_answers[subject_name] = answers
+        break #debugggggg
 
     json.dump(all_answers, open(save_result_dir + "/submission.json", "w"), ensure_ascii=False, indent=4)
     print("Accuracy:")
     for k, v in accuracy.items():
         print(k, ": ", v)
 
-    total_num = 0
-    total_correct = 0
-    summary["grouped"] = {
-        "STEM": {"correct": 0.0, "num": 0},
-        "Social Science": {"correct": 0.0, "num": 0},
-        "Humanities": {"correct": 0.0, "num": 0},
-        "Other": {"correct": 0.0, "num": 0},
-    }
-    for subj, info in subject_mapping.items():
-        group = info[2]
-        summary["grouped"][group]["num"] += summary[subj]["num"]
-        summary["grouped"][group]["correct"] += summary[subj]["correct"]
-    for group, info in summary["grouped"].items():
-        info["score"] = info["correct"] / info["num"]
-        total_num += info["num"]
-        total_correct += info["correct"]
-    summary["All"] = {"score": total_correct / total_num, "num": total_num, "correct": total_correct}
+    # total_num = 0
+    # total_correct = 0
+    # summary["grouped"] = {
+    #     "STEM": {"correct": 0.0, "num": 0},
+    #     "Social Science": {"correct": 0.0, "num": 0},
+    #     "Humanities": {"correct": 0.0, "num": 0},
+    #     "Other": {"correct": 0.0, "num": 0},
+    # }
+    # for subj, info in subject_mapping.items():
+    #     group = info[2]
+    #     summary["grouped"][group]["num"] += summary[subj]["num"]
+    #     summary["grouped"][group]["correct"] += summary[subj]["correct"]
+    # for group, info in summary["grouped"].items():
+    #     info["score"] = info["correct"] / info["num"]
+    #     total_num += info["num"]
+    #     total_correct += info["correct"]
+    # summary["All"] = {"score": total_correct / total_num, "num": total_num, "correct": total_correct}
 
-    json.dump(summary, open(save_result_dir + "/summary.json", "w"), ensure_ascii=False, indent=2)
+    # json.dump(summary, open(save_result_dir + "/summary.json", "w"), ensure_ascii=False, indent=2)
 
-    print(summary["All"])
-    print("All done!")
-    print(args.output_dir)
+    # print(summary["All"])
+    # print("All done!")
+    # print(args.output_dir)
 
 
 if __name__ == "__main__":
@@ -432,5 +439,35 @@ if __name__ == "__main__":
     if args.do_ptq or args.do_shift or args.do_smooth or args.do_gptq or args.do_int4 or args.do_awq:
         run_ptq(args, evaluator=evaluator)
 
+    # evaluator.model = SlimAnalysis(evaluator.model)
+
+    print(evaluator.model)
+    # for layer in evaluator.model.sublayers():
+    #     if isinstance(layer, QWenRMSNorm):
+    #         layer.test_mode = False
+    # print("######################### Calibration by test data ###########################")
+    # for param in evaluator.model.parameters():
+    #     if param.name == "embedding_0.w_0":
+    #         param.stop_gradient = False
+    #     else:
+    #         param.stop_gradient = True
+    # main(args, evaluator=evaluator, take=0, do_test=False, do_backward=True)
+    
+    for layer in evaluator.model.sublayers():
+        if isinstance(layer, QWenRMSNorm):
+            layer.test_mode = True
+            
+    print("######################### Test accuracy ###########################")
     for i in range(args.n_times):
-        main(args, evaluator=evaluator, take=i)
+        main(args, evaluator=evaluator, take=i, do_test=False, do_backward=False)
+
+    # data = {}
+    # pruned_ratios = []
+    # for layer in evaluator.model.sublayers():
+    #     if isinstance(layer, QWenRMSNorm):
+    #         data[layer.weight.name] = {}
+    #         data[layer.weight.name]["covariance"] = layer.covariance.data.numpy()
+    #         data[layer.weight.name]["eigvals"] = layer.eigvals.data.numpy()
+    #         pruned_ratios.append(layer.pruned_ratio)
+    # print(f"average pruned ratio: {np.mean(pruned_ratios)}")
+    # pickle.dump(data, open("./covariance.pkl", "wb"))

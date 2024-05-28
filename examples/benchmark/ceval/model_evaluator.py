@@ -73,6 +73,7 @@ class ModelEvaluator(Evaluator):
         with_prompt=False,
         constrained_decoding=False,
         do_test=False,
+        do_backward=False,
     ):
         all_answers = {}
 
@@ -92,12 +93,25 @@ class ModelEvaluator(Evaluator):
             batch_size, length = inputs.input_ids.shape
             if constrained_decoding is True:
                 # batch_size is 1, take the last logits as the logits for next token prediction
-                with paddle.no_grad():
+
+                if do_backward:
+                    self.model.train()
                     logits = self.model(**inputs)[0][0, -1, :]
-                choices_logits = logits[[self.A_id, self.B_id, self.C_id, self.D_id]].numpy()
+                    choices_logits = logits[[self.A_id, self.B_id, self.C_id, self.D_id]]
+                    loss = -paddle.log(choices_logits.max())
+                    loss.backward()
+                    loss.clear_gradient(False)
+                else:
+                    self.model.eval()
+                    with paddle.no_grad():
+                        logits = self.model(**inputs)[0][0, -1, :]
+                        choices_logits = logits[[self.A_id, self.B_id, self.C_id, self.D_id]]
+
+                choices_logits = choices_logits.numpy()
                 assert not (np.any(np.isinf(choices_logits)) or np.any(np.isnan(choices_logits)))
                 ans = {0: "A", 1: "B", 2: "C", 3: "D"}[np.argmax(choices_logits)]
                 response = self.tokenizer.decode([logits.argmax(-1).item()])
+
             else:
                 generation_output = self.model.generate(
                     **inputs,
@@ -123,6 +137,7 @@ class ModelEvaluator(Evaluator):
             print(f"=======end {str(row_index)}=======")
 
             all_answers[str(row_index)] = ans
+            break # test one sample in the subject
 
         correct_ratio = 100 * correct_num / len(answers)
 
@@ -133,7 +148,7 @@ class ModelEvaluator(Evaluator):
 
         return correct_ratio, all_answers
 
-    def prepare_ptq(self, quant_bits=8, args=args):
+    def prepare_ptq(self, quant_bits=8, args=None):
         from paddle.distributed.fleet.meta_parallel import (
             ColumnParallelLinear,
             RowParallelLinear,
