@@ -19,6 +19,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import datasets
 import numpy as np
 import paddle
+from paddle.profiler import Profiler
 import paddle.distributed as dist
 import paddle.nn as nn
 from datasets import Dataset
@@ -57,6 +58,7 @@ class SFTTrainer(Trainer):
         gen_args=None,
         data_args=None,
         formatting_func: Optional[Callable] = None,
+        profiler:Optional[Profiler]=None,
     ):
 
         self.do_generation = do_generation
@@ -176,6 +178,7 @@ class SFTTrainer(Trainer):
             callbacks=callbacks,
             optimizers=optimizers,
             preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+            profiler=profiler,
         )
 
     def _prepare_dataset(

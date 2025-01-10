@@ -41,7 +41,7 @@ import paddle.distributed as dist
 import paddle.nn as nn
 from packaging import version
 from paddle import framework
-
+from paddle.profiler import Profiler
 try:
     from paddle.base import core
 except:
@@ -278,6 +278,7 @@ class Trainer:
         callbacks: Optional[List[TrainerCallback]] = None,
         optimizers: Tuple[paddle.optimizer.Optimizer, paddle.optimizer.lr.LRScheduler] = (None, None),
         preprocess_logits_for_metrics: Callable[[paddle.Tensor, paddle.Tensor], paddle.Tensor] = None,
+        profiler:Optional[Profiler] = None,
     ):
 
         if args is None:
@@ -456,6 +457,8 @@ class Trainer:
         self.label_names = default_label_names if self.args.label_names is None else self.args.label_names
 
         self.control = self.callback_handler.on_init_end(self.args, self.state, self.control)
+        self.profiler = profiler
+
         self.print_config()
 
         # very last
@@ -906,6 +909,7 @@ class Trainer:
         resume_from_checkpoint,
         ignore_keys_for_eval,
     ):
+        print("_inner_training_loop-----------------------------")
         start_time = time.time()
         self._globalstep_last_start_time = time.time()
         self.state.epoch = 0
@@ -999,7 +1003,8 @@ class Trainer:
 
         if self.args.ignore_data_skip:
             self.timers and self.timers("read-data").start()
-
+        if self.profiler:
+            self.profiler.start()
         for epoch in range(epochs_trained, num_train_epochs):
             if isinstance(train_dataloader, paddle.io.DataLoader) and isinstance(
                 train_dataloader.batch_sampler, DistributedBatchSampler
@@ -1011,6 +1016,10 @@ class Trainer:
 
             step = -1
             for step, inputs in enumerate(epoch_iterator):
+                print(f"self.state.global_step: {self.state.global_step}")
+                self.profiler.step()
+                if self.state.global_step > 5:
+                    break
                 if self.args.use_hybrid_parallel and self.args.sep_parallel_degree > 1:
                     inputs = split_inputs_sequence_dim(inputs)
                 if self.args.use_hybrid_parallel and self.args.context_parallel_degree > 1:
@@ -1125,6 +1134,7 @@ class Trainer:
                 tr_loss += tr_loss_step
 
                 def fused_allreduce_gradients_no_sync(paramlist, hcg):
+                    print("fused_allreduce_gradients_no_sync................")
                     paramlist = list(paramlist)
                     nonmoe_list = [p for p in paramlist if not getattr(p, "no_sync", False)]
                     moelist = [p for p in paramlist if getattr(p, "no_sync", False)]
@@ -1351,7 +1361,7 @@ class Trainer:
             "metrics_dumper": self.metrics_dumper,
         }
         self.control = self.callback_handler.on_train_end(args, self.state, self.control, **kwargs)
-
+        self.profiler.stop()
         return TrainOutput(self.state.global_step, train_loss, metrics)
 
     def _load_best_model_from_peft_checkpoint(self):
@@ -1543,6 +1553,7 @@ class Trainer:
             self.log(logs, **kwargs)
 
         metrics = None
+        self.control.should_evaluate = False
         if self.control.should_evaluate:
             if isinstance(self.optimizer, GroupShardedOptimizerStage2) and self.optimizer._broadcast_overlap:
                 paddle.device.synchronize()
@@ -1556,7 +1567,7 @@ class Trainer:
                     )
             else:
                 metrics = self.evaluate(ignore_keys=ignore_keys_for_eval)
-
+        self.control.should_save = False
         if self.control.should_save:
             if isinstance(self.optimizer, GroupShardedOptimizerStage2) and self.optimizer._broadcast_overlap:
                 paddle.device.synchronize()
@@ -2226,7 +2237,7 @@ class Trainer:
                     and "enable_stage1_broadcast_overlap" in self.args.sharding_parallel_config
                 ):
                     self.optimizer._set_broadcast_overlap(True, model)
-
+        print(f"model type: {type(model)}")
         return model
 
     def _prepare_input(self, data: Union[paddle.Tensor, Any]) -> Union[paddle.Tensor, Any]:

@@ -19,6 +19,8 @@ import sys
 from functools import partial
 
 import paddle
+import paddlenlp
+import paddle.profiler as profiler
 from utils.argument import GenerateArgument, ReftArgument
 from utils.data import convert_example_for_reft, get_convert_example
 
@@ -90,6 +92,7 @@ def paddlenlp_verison_check():
 
 def main():
     paddlenlp_verison_check()
+    print(paddlenlp.__file__)
     parser = PdArgumentParser((GenerateArgument, ModelConfig, ReftArgument, DataConfig, SFTConfig))
     if len(sys.argv) >= 2 and sys.argv[1].endswith(".json"):
         gen_args, model_args, reft_args, data_args, training_args = parser.parse_json_file_and_cmd_lines()
@@ -389,6 +392,15 @@ def main():
         return_attention_mask=not model_args.flash_mask,
         pad_to_multiple_of=data_args.pad_to_multiple_of,
     )
+    def my_on_trace_ready(prof):
+      callback = profiler.export_chrome_tracing('./profiler_data') 
+      callback(prof)
+      prof.summary(sorted_by=profiler.SortedKeys.GPUTotal) # 打印表单，按 GPUTotal 排序表单项
+    prof = profiler.Profiler(targets=[profiler.ProfilerTarget.CPU, profiler.ProfilerTarget.GPU],
+                   scheduler = (2, 5),
+                   on_trace_ready = my_on_trace_ready,
+                   timer_only = False)
+    print(f"model: {model}")
     trainer = SFTTrainer(
         model=model,
         args=training_args,
@@ -401,6 +413,7 @@ def main():
         callbacks=[ZeroPaddingIterDatasetCallback()] if isinstance(train_ds, ZeroPaddingIterableDataset) else None,
         gen_args=gen_args,
         data_args=data_args,
+        profiler=prof,
     )
     trainable_parameters = [p for p in model.parameters() if not p.stop_gradient]
     trainer.set_optimizer_grouped_parameters(trainable_parameters)
@@ -412,7 +425,10 @@ def main():
             checkpoint = training_args.resume_from_checkpoint
         elif last_checkpoint is not None:
             checkpoint = last_checkpoint
-        train_result = trainer.train(resume_from_checkpoint=checkpoint)
+        with prof:
+            print(f"training model with profiling...")
+            train_result = trainer.train(resume_from_checkpoint=checkpoint)
+        prof.summary(sorted_by=profiler.SortedKeys.GPUTotal)
         if model_args.neftune:
             neft_post_hook_handle.remove()
         if training_args.benchmark:
@@ -432,12 +448,14 @@ def main():
                 trainer.save_metrics("train", train_result.metrics)
                 trainer.save_state()
 
+    print(f"training_args.do_predict: {training_args.do_predict}; training_args.do_eval: {training_args.do_eval}")
     # Evaluation test set
     if training_args.do_predict:
         eval_result = trainer.predict(test_ds).metrics
         trainer.log_metrics("test", eval_result)
 
     # Evaluation dev set
+    training_args.do_eval = False
     if training_args.do_eval:
         logger.info("*** Evaluate result after train ***")
         eval_result = trainer.evaluate(dev_ds)
